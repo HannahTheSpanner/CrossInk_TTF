@@ -1,13 +1,18 @@
 #include "SdCardFontRegistry.h"
 
+#if CROSSPOINT_VECTOR_FONTS
+#include <FtFont.h>
+#endif
 #include <FsHelpers.h>
 #include <HalStorage.h>
 #include <Logging.h>
 #include <MemoryBudget.h>
+#include <strings.h>  // strcasecmp / strncasecmp
 
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "FontCatalogIndex.h"
@@ -43,6 +48,8 @@ const SdCardFontFileInfo* SdCardFontFamilyInfo::findClosestFile(uint8_t targetSi
 
 std::vector<uint8_t> SdCardFontFamilyInfo::availableSizes() const {
   if (!ensureDetails()) return {};
+  // Vector fonts render at any size; offer the fixed TTF reader size set.
+  if (vector) return {std::begin(VECTOR_FONT_POINT_SIZES), std::end(VECTOR_FONT_POINT_SIZES)};
   std::vector<uint8_t> sizes;
   for (const auto& f : files) {
     bool found = false;
@@ -95,7 +102,150 @@ bool SdCardFontRegistry::parseFilename(const char* filename, uint8_t& size, uint
   return true;
 }
 
+#if CROSSPOINT_VECTOR_FONTS
+
+bool SdCardFontRegistry::parseVectorFontName(const char* filename, size_t& baseLen) {
+  static constexpr const char* kExts[] = {".ttf", ".otf", ".ttc"};
+  const size_t nameLen = strlen(filename);
+  for (const char* ext : kExts) {
+    const size_t extLen = strlen(ext);
+    if (nameLen <= extLen) continue;
+    const char* tail = filename + nameLen - extLen;
+    if (strcasecmp(tail, ext) == 0) {
+      baseLen = nameLen - extLen;
+      return baseLen > 0 && baseLen <= 127;
+    }
+  }
+  return false;
+}
+
+uint8_t SdCardFontRegistry::parseVectorStyle(const char* baseName, size_t baseLen) {
+  // Case-insensitive token scan. "bold" (incl. semibold/demibold) -> bold bit;
+  // "italic"/"oblique" -> italic bit. Anything else is regular.
+  bool bold = false;
+  bool ital = false;
+  const size_t n = baseLen;
+  for (size_t i = 0; i < n; ++i) {
+    if ((n - i) >= 4 && strncasecmp(baseName + i, "bold", 4) == 0) bold = true;
+    if ((n - i) >= 6 && strncasecmp(baseName + i, "italic", 6) == 0) ital = true;
+    if ((n - i) >= 7 && strncasecmp(baseName + i, "oblique", 7) == 0) ital = true;
+  }
+  return static_cast<uint8_t>((bold ? 1 : 0) | (ital ? 2 : 0));
+}
+
+// FtFont::ReadFn over a HalFile (absolute-offset reads; count 0 is a seek probe).
+unsigned long SdCardFontRegistry::halFileRead(void* ctx, const unsigned long offset, unsigned char* buffer,
+                                              const unsigned long count) {
+  auto* f = static_cast<HalFile*>(ctx);
+  if (f == nullptr || !*f) return 0;
+  if (!f->seek(static_cast<size_t>(offset))) return 0;
+  if (count == 0) return 0;
+  const int n = f->read(buffer, count);
+  return n < 0 ? 0 : static_cast<unsigned long>(n);
+}
+
+void SdCardFontRegistry::refineVectorStyles(const char* dirPath, std::vector<SdCardFontFileInfo>& files) {
+  using freeink::font::FtFont;
+  // Read each face's real weight + italic flag (inspectStream reads only the
+  // sfnt header tables, no face is retained), then pick the four roles
+  // DETERMINISTICALLY by design weight: the upright face nearest 400 is
+  // regular, nearest 700 is bold; same for the italics. This is independent of
+  // SD directory order: a Regular/Medium/Semibold/Bold/Black family always
+  // resolves to Regular + Bold, not to whichever file happened to enumerate
+  // first. An unreadable face falls back to its filename-derived role
+  // (Regular/Bold tokens -> 400/700).
+  struct Candidate {
+    size_t index;  // into files
+    uint16_t weight;
+    bool italic;
+  };
+  std::vector<Candidate> cands;
+  cands.reserve(files.size());
+  for (size_t i = 0; i < files.size(); ++i) {
+    Candidate c{i, static_cast<uint16_t>((files[i].style & 1) ? 700 : 400), (files[i].style & 2) != 0};
+    HalFile f = Storage.open(files[i].path.c_str());
+    if (f && !f.isDirectory()) {
+      FtFont::FaceInfo face;
+      if (FtFont::inspectStream(&halFileRead, &f, static_cast<unsigned long>(f.size()), face) ==
+          FtFont::InspectResult::Ok) {
+        c.weight = face.weight;
+        c.italic = face.italic;
+      }
+    }
+    f.close();
+    cands.push_back(c);
+  }
+
+  // Nearest target weight within the upright/italic bucket; ties break to the
+  // lower weight, then the lexicographically smaller path, never enumeration
+  // order. `exclude` keeps bold from re-picking the regular file.
+  const auto pick = [&](const bool italic, const int target, const Candidate* exclude) -> const Candidate* {
+    const Candidate* best = nullptr;
+    for (const auto& c : cands) {
+      if (c.italic != italic || &c == exclude) continue;
+      if (!best) {
+        best = &c;
+        continue;
+      }
+      const int dc = std::abs(static_cast<int>(c.weight) - target);
+      const int db = std::abs(static_cast<int>(best->weight) - target);
+      if (dc < db || (dc == db && (c.weight < best->weight ||
+                                   (c.weight == best->weight && files[c.index].path < files[best->index].path)))) {
+        best = &c;
+      }
+    }
+    return best;
+  };
+
+  const Candidate* regular = pick(false, 400, nullptr);
+  if (!regular) {
+    // All faces italic: the italic nearest 400 anchors the family as regular
+    // (TtfEpdFont needs a regular source; it derives the rest).
+    regular = pick(true, 400, nullptr);
+    if (regular) LOG_DBG("SDREG", "No upright face in %s, promoting %s", dirPath, files[regular->index].path.c_str());
+    if (!regular) {
+      files.clear();
+      return;  // no usable files at all
+    }
+  }
+  // Bold must be a genuinely heavier face than the regular pick; otherwise the
+  // synthesizer derives it (a same-or-lighter file would render identically).
+  const Candidate* bold = pick(false, 700, regular);
+  if (bold && bold->weight <= regular->weight) bold = nullptr;
+  const Candidate* italic = regular->italic ? nullptr : pick(true, 400, nullptr);
+  const Candidate* boldItalic = pick(true, 700, italic ? italic : regular);
+  if (boldItalic && italic && boldItalic->weight <= italic->weight) boldItalic = nullptr;
+  if (boldItalic && !boldItalic->italic) boldItalic = nullptr;
+
+  std::vector<SdCardFontFileInfo> selected;
+  selected.reserve(4);
+  const auto add = [&](const Candidate* c, const uint8_t role) {
+    if (!c) return;
+    SdCardFontFileInfo info = files[c->index];
+    info.pointSize = 0;
+    info.style = role;
+    selected.push_back(std::move(info));
+  };
+  add(regular, 0);
+  add(bold, 1);
+  add(italic, 2);
+  add(boldItalic, 3);
+  if (selected.size() < files.size()) {
+    LOG_DBG("SDREG", "%s: %u of %u faces selected by weight", dirPath, static_cast<unsigned>(selected.size()),
+            static_cast<unsigned>(files.size()));
+  }
+  files = std::move(selected);
+}
+
+#endif  // CROSSPOINT_VECTOR_FONTS
+
 namespace {
+#if CROSSPOINT_VECTOR_FONTS
+// Summary range recorded for vector families (they render at any size).
+constexpr uint8_t kVectorFirstSize = VECTOR_FONT_POINT_SIZES[0];
+constexpr uint8_t kVectorLastSize = VECTOR_FONT_POINT_SIZES[sizeof(VECTOR_FONT_POINT_SIZES) - 1];
+#endif
+
 bool scanFamilySummary(const char* dirPath, SdCardFontFamilyInfo& family) {
   HalFile dir = Storage.open(dirPath);
   if (!dir || !dir.isDirectory()) {
@@ -110,6 +260,12 @@ bool scanFamilySummary(const char* dirPath, SdCardFontFamilyInfo& family) {
   char name[128];
   uint16_t count = 0;
   uint8_t first = UINT8_MAX, last = 0;
+#if CROSSPOINT_VECTOR_FONTS
+  // Vector files are collected alongside; they only form the family when the
+  // folder holds no .cpfont files (a pre-rasterized family is the more
+  // specific artifact, so .cpfont wins a mixed folder).
+  std::vector<SdCardFontFileInfo> vectorFiles;
+#endif
   while (true) {
     HalFile entry = dir.openNextFile();
     if (!entry) break;
@@ -119,7 +275,20 @@ bool scanFamilySummary(const char* dirPath, SdCardFontFamilyInfo& family) {
     if (isDirectory || name[0] == '.' || name[0] == '_') continue;
 
     uint8_t size = 0, style = 0;
-    if (!SdCardFontRegistry::parseFilename(name, size, style)) continue;
+    if (!SdCardFontRegistry::parseFilename(name, size, style)) {
+#if CROSSPOINT_VECTOR_FONTS
+      size_t baseLen = 0;
+      if (SdCardFontRegistry::parseVectorFontName(name, baseLen) && vectorFiles.size() < fontcatalog::MaxFiles &&
+          std::strlen(dirPath) + 1 + std::strlen(name) <= fontcatalog::MaxPath) {
+        SdCardFontFileInfo info;
+        info.path = std::string(dirPath) + "/" + name;
+        info.pointSize = 0;  // size-free
+        info.style = SdCardFontRegistry::parseVectorStyle(name, baseLen);
+        vectorFiles.push_back(std::move(info));
+      }
+#endif
+      continue;
+    }
     const size_t pathLength = std::strlen(dirPath) + 1 + std::strlen(name);
     if (pathLength > fontcatalog::MaxPath) continue;
     const uint8_t mask = uint8_t(1U << (size & 7U));
@@ -135,6 +304,19 @@ bool scanFamilySummary(const char* dirPath, SdCardFontFamilyInfo& family) {
   const bool ok = !FsHelpers::directoryIterationFailed(dir);
   dir.close();
   if (!ok) return false;
+#if CROSSPOINT_VECTOR_FONTS
+  if (count == 0 && !vectorFiles.empty()) {
+    // The directory handle is closed: face inspection opens each file in turn.
+    SdCardFontRegistry::refineVectorStyles(dirPath, vectorFiles);
+    if (vectorFiles.empty()) return true;
+    family.vector = true;
+    family.files = std::move(vectorFiles);
+    family.indexCount = static_cast<uint16_t>(family.files.size());
+    family.firstSize = kVectorFirstSize;
+    family.lastSize = kVectorLastSize;
+    return true;
+  }
+#endif
   family.indexCount = count;
   family.firstSize = count ? first : 0;
   family.lastSize = last;
@@ -159,9 +341,22 @@ bool addFamilySummaries(const char* rootPath, bool visibleRoot, std::vector<SdCa
     HalFile entry = root.openNextFile();
     if (!entry) break;
     const bool isDirectory = entry.isDirectory();
+#if CROSSPOINT_VECTOR_FONTS
+    entry.getName(name, sizeof(name));
+    entry.close();
+    if (name[0] == '.' || name[0] == '_') continue;
+    // Loose TrueType/OpenType file directly under the root (e.g.
+    // /fonts/Bookerly.ttf): a one-file vector family named after the file.
+    size_t vectorBaseLen = 0;
+    const bool looseVector = !isDirectory && SdCardFontRegistry::parseVectorFontName(name, vectorBaseLen);
+    if (!isDirectory && !looseVector) continue;
+    if (looseVector) name[vectorBaseLen] = '\0';  // family name = filename without extension
+#else
     if (isDirectory) entry.getName(name, sizeof(name));
     entry.close();
     if (!isDirectory || name[0] == '.' || name[0] == '_') continue;
+    constexpr bool looseVector = false;
+#endif
 
     bool duplicate = false;
     for (const auto& family : families) {
@@ -172,13 +367,34 @@ bool addFamilySummaries(const char* rootPath, bool visibleRoot, std::vector<SdCa
     }
     if (duplicate) continue;
 
-    const int length = std::snprintf(path, sizeof(path), "%s/%s", rootPath, name);
-    if (length <= 0 || static_cast<size_t>(length) >= sizeof(path)) continue;
     SdCardFontFamilyInfo family;
     family.name = name;
-    if (!scanFamilySummary(path, family)) {
-      root.close();
-      return false;
+#if CROSSPOINT_VECTOR_FONTS
+    if (looseVector) {
+      name[vectorBaseLen] = '.';  // restore the extension for the file path
+      const int length = std::snprintf(path, sizeof(path), "%s/%s", rootPath, name);
+      if (length <= 0 || static_cast<size_t>(length) >= sizeof(path) ||
+          static_cast<size_t>(length) > fontcatalog::MaxPath) {
+        continue;
+      }
+      SdCardFontFileInfo info;
+      info.path = path;
+      info.pointSize = 0;  // size-free
+      info.style = 0;      // a loose file is always the regular source
+      family.vector = true;
+      family.files.push_back(std::move(info));
+      family.indexCount = 1;
+      family.firstSize = kVectorFirstSize;
+      family.lastSize = kVectorLastSize;
+    }
+#endif
+    if (!looseVector) {
+      const int length = std::snprintf(path, sizeof(path), "%s/%s", rootPath, name);
+      if (length <= 0 || static_cast<size_t>(length) >= sizeof(path)) continue;
+      if (!scanFamilySummary(path, family)) {
+        root.close();
+        return false;
+      }
     }
     // Invalid/empty directories do not consume the catalog limit and cannot
     // shadow a valid family in the lower-priority visible root.
@@ -200,6 +416,29 @@ bool addFamilySummaries(const char* rootPath, bool visibleRoot, std::vector<SdCa
   root.close();
   return ok;
 }
+
+#if CROSSPOINT_VECTOR_FONTS
+// Vector families were fully resolved during the summary scan (at most one
+// file per style role), so their detail block is written straight from it.
+bool writeVectorFamilyDetails(HalFile& index, const SdCardFontFamilyInfo& family, fontcatalog::Entry& summary) {
+  bool ok = !family.files.empty();
+  for (const auto& file : family.files) {
+    if (!ok) break;
+    const size_t length = file.path.size();
+    if (length == 0 || length > fontcatalog::MaxPath || file.style >= 4) {
+      ok = false;
+      break;
+    }
+    const uint8_t meta[] = {0, file.style, uint8_t(length)};
+    summary.hash = fontcatalog::hashBytes(summary.hash, meta, sizeof(meta));
+    summary.hash = fontcatalog::hashBytes(summary.hash, file.path.data(), length);
+    ok = index.write(meta, sizeof(meta)) == sizeof(meta) && index.write(file.path.data(), length) == length;
+    summary.bytes += sizeof(meta) + static_cast<uint32_t>(length);
+    ++summary.count;
+  }
+  return ok && summary.count == family.indexCount;
+}
+#endif
 
 bool writeFamilyDetails(HalFile& index, const char* dirPath, const uint16_t expectedCount,
                         fontcatalog::Entry& summary) {
@@ -433,6 +672,9 @@ bool SdCardFontRegistry::readIndex(uint64_t fingerprint) {
     family.indexBytes = entry.bytes;
     family.indexHash = entry.hash;
     family.indexCount = entry.count;
+#if CROSSPOINT_VECTOR_FONTS
+    family.vector = (entry.flags & EntryFlagVector) != 0;
+#endif
     next += entry.bytes;
     families_.push_back(std::move(family));
   }
@@ -503,7 +745,15 @@ bool SdCardFontRegistry::rebuildIndex(uint64_t fingerprint, uint32_t generation)
     entry.last = family.lastSize;
     entry.hash = 2166136261u;
     ok = file.seek(offset);
-    if (ok) ok = writeFamilyDetails(file, familyPath, family.indexCount, entry);
+#if CROSSPOINT_VECTOR_FONTS
+    if (family.vector) {
+      entry.flags |= EntryFlagVector;
+      if (ok) ok = writeVectorFamilyDetails(file, family, entry);
+    } else
+#endif
+        if (ok) {
+      ok = writeFamilyDetails(file, familyPath, family.indexCount, entry);
+    }
     entry.checksum = hashBytes(2166136261u, &entry, offsetof(Entry, checksum));
     offset += entry.bytes;
     ok = ok && offset <= MaxBytes && file.seek(sizeof(Header) + i * sizeof(Entry)) &&
@@ -550,7 +800,8 @@ bool SdCardFontFamilyInfo::ensureDetails() const {
     ok = remaining >= sizeof(meta) && file.read(meta, sizeof(meta)) == sizeof(meta);
     if (!ok) break;
     remaining -= sizeof(meta);
-    ok = meta[0] != 0 && meta[2] > 0 && meta[2] <= remaining && meta[1] < 4;
+    // .cpfont entries carry their point size; vector entries are size-free (0).
+    ok = (vector ? meta[0] == 0 : meta[0] != 0) && meta[2] > 0 && meta[2] <= remaining && meta[1] < 4;
     if (!ok) break;
     SdCardFontFileInfo font;
     font.pointSize = meta[0];

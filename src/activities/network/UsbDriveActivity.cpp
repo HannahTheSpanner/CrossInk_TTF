@@ -30,6 +30,9 @@ void UsbDriveActivity::onEnter() {
   // its block device to the host. The two operations must never overlap.
   requestUpdateAndWait();
 #ifndef SIMULATOR
+  // A streamed TTF font keeps its file open; close it before the host owns
+  // the card. No-op for .cpfont and built-in fonts.
+  sdFontSystem.releaseOpenFontFiles(renderer);
   // The host can replace fonts without going through firmware file APIs.
   sdFontSystem.markRegistryDirty();
   if (!Storage.beginUsbDrive()) {
