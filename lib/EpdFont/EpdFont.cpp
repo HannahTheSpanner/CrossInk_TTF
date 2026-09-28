@@ -235,6 +235,13 @@ const EpdGlyph* EpdFont::findGlyph(const uint32_t cp) const {
     }
   }
 
+  // Runtime-rasterized (TTF) fonts keep no interval table: every glyph is
+  // faulted into their own cache through the miss handler, so it is their
+  // lookup. SD (.cpfont) fonts keep this lookup RAM-only as before.
+  if (data->vectorBitmapHandler && data->glyphMissHandler) {
+    return data->glyphMissHandler(data->glyphMissCtx, cp);
+  }
+
   return nullptr;
 }
 
@@ -244,7 +251,8 @@ const EpdGlyph* EpdFont::getGlyph(const uint32_t cp) const {
   }
 
   // Codepoint not in interval table — try on-demand loading (SD card fonts).
-  if (data->glyphMissHandler) {
+  // Vector fonts already consulted their miss handler in findGlyph().
+  if (data->glyphMissHandler && !data->vectorBitmapHandler) {
     const EpdGlyph* loaded = data->glyphMissHandler(data->glyphMissCtx, cp);
     if (loaded) return loaded;
   }
