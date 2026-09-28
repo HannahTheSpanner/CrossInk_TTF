@@ -59,6 +59,50 @@ There are three ways to install fonts:
 
 3.  Insert the SD card and power on your CrossInk device
 
+## Direct TrueType/OpenType Fonts (X4 Pro, X4 Classic, Sticky)
+
+Readers with external RAM (Xteink X4 Pro, X4 Classic and reTerminal Sticky)
+can also use `.ttf`, `.otf` and `.ttc` files directly, with no conversion.
+The X3 and X4 do not have the memory for this and keep using `.cpfont` files
+only. All devices can still use `.cpfont` files.
+
+1.  Copy the font to `/fonts/` or `/.fonts/` on the SD card, using USB Drive
+    (`Home > File Transfer > USB Drive`) or a card reader. The web Fonts tab
+    only accepts `.cpfont` uploads.
+    - A single file becomes a family named after the file:
+      `/fonts/Literata.ttf` appears as `Literata`.
+    - For a family with separate styles, put the files in one folder. The
+      folder name becomes the family name:
+
+            /fonts/Literata/Literata-Regular.ttf
+            /fonts/Literata/Literata-Bold.ttf
+            /fonts/Literata/Literata-Italic.ttf
+            /fonts/Literata/Literata-BoldItalic.ttf
+
+2.  Choose the family in **Settings > Reader > Font Options > Font Family**.
+
+How direct fonts behave:
+
+- **Sizes:** direct fonts are offered at 10, 11, 12 and 13 pt.
+- **Styles:** regular, bold, italic and bold italic are picked from the files'
+  own weight and italic metadata, so extra weights (Light, Medium, Black) in
+  the folder are ignored. Only a regular file is required: missing styles are
+  derived from it (a variable font's weight axis, or a synthetic bold and
+  slant).
+- **Outlines:** fonts must use TrueType outlines. Most `.ttf` files and many
+  `.otf` files do. OpenType fonts with PostScript (CFF) outlines, such as the
+  `.otf` releases of Source Han or Noto CJK, will not load; use their `.ttf`
+  versions instead (for example from Google Fonts).
+- **Mixed folders:** a folder that holds both `.cpfont` and TrueType files is
+  treated as a `.cpfont` family. Keep the two formats in separate folders.
+- **Large fonts:** files up to about 6 MB are loaded into memory. Larger ones
+  (typically CJK) are read from the SD card as needed, which is slower and
+  skips GPOS kerning.
+- **Dictionary:** a direct font cannot be a separate dictionary font. When one
+  is selected, definitions use the reader font.
+- **Removing:** the web Fonts page deletes direct font families, including
+  single loose files.
+
 ## Dictionary Fonts
 
 EPUB books can use a different installed SD-card family for dictionary definitions.

@@ -143,6 +143,25 @@ FontInstaller::Error FontInstaller::deleteFamily(const char* familyName) {
     removedAny = true;
   }
 
+#if CROSSPOINT_VECTOR_FONTS
+  // A loose TrueType/OpenType file directly under a root (/fonts/Name.ttf) is
+  // a one-file family named after the file; delete it the same way.
+  static constexpr const char* kVectorExts[] = {".ttf", ".otf", ".ttc", ".TTF", ".OTF", ".TTC"};
+  for (const char* root : roots) {
+    for (const char* ext : kVectorExts) {
+      char filePath[192];
+      snprintf(filePath, sizeof(filePath), "%s/%s%s", root, familyName, ext);
+      if (!Storage.exists(filePath)) continue;
+      sawAny = true;
+      if (!Storage.remove(filePath)) {
+        LOG_ERR("FONT", "Failed to remove font file: %s", filePath);
+        return Error::SD_WRITE_ERROR;
+      }
+      removedAny = true;
+    }
+  }
+#endif
+
   if (!sawAny) {
     LOG_DBG("FONT", "Family not found in any fonts root: %s", familyName);
     return Error::OK;  // Already gone

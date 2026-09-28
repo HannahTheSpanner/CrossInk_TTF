@@ -7,16 +7,23 @@
 
 class FontDecompressor;
 class SdCardFont;
+class TtfEpdFont;
 
 class FontCacheManager {
  public:
   enum class PreparationPolicy : uint8_t { Normal, DictionaryLean };
 
-  FontCacheManager(const std::map<int, EpdFontFamily>& fontMap, const std::map<int, SdCardFont*>& sdCardFonts);
+  FontCacheManager(const std::map<int, EpdFontFamily>& fontMap, const std::map<int, SdCardFont*>& sdCardFonts,
+                   const std::map<int, TtfEpdFont*>& ttfFonts);
 
   void setFontDecompressor(FontDecompressor* d);
 
   void clearCache();
+  // Release every rebuildable font cache while keeping the fonts loaded:
+  //   * SD (.cpfont): SdCardFont::releaseForLowMemory().
+  //   * TTF (vector): byte arenas, glyph tables, and the lazy bold/italic
+  //     FreeType faces (TtfEpdFont::releaseResidentCaches).
+  // Everything faults back in on demand.
   void releaseSdFontCaches();
   bool prewarmCache(int fontId, const char* utf8Text, uint8_t styleMask = 0x0F,
                     PreparationPolicy policy = PreparationPolicy::Normal);
@@ -51,6 +58,8 @@ class FontCacheManager {
  private:
   const std::map<int, EpdFontFamily>& fontMap_;
   const std::map<int, SdCardFont*>& sdCardFonts_;
+  // Read only when CROSSPOINT_VECTOR_FONTS is on (PSRAM boards).
+  [[maybe_unused]] const std::map<int, TtfEpdFont*>& ttfFonts_;
   FontDecompressor* fontDecompressor_ = nullptr;
 
   enum class ScanMode : uint8_t { None, Scanning };

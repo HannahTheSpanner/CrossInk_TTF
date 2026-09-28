@@ -1,3 +1,9 @@
+## [Unreleased]
+
+### Added
+
+- X4 Pro, X4 Classic and reTerminal Sticky can use TrueType/OpenType fonts (`.ttf`, `.otf`, `.ttc`) copied straight to `/fonts/` or `/.fonts/`, alongside `.cpfont` fonts. Direct fonts are offered at 10, 11, 12 and 13 pt. Ported from CrossPoint Reader's TrueType support (crosspoint-reader#3646).
+
 ## [v1.6.0] - 2026-09-21
 
 ### Added

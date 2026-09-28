@@ -15,6 +15,7 @@ enum class BidiBaseDir : signed char { AUTO = -1, LTR = 0, RTL = 1 };
 
 class FontCacheManager;
 class SdCardFont;
+class TtfEpdFont;
 
 #include <cassert>
 #include <cstring>
@@ -99,6 +100,10 @@ class GfxRenderer {
   // allocation inside the SdCardFont objects. Same pragmatic compromise as
   // fontCacheManager_ below.
   mutable std::map<int, SdCardFont*> sdCardFonts_;
+  // TTF (vector) fonts rendered via TtfEpdFont/FreeInkFont (PSRAM boards only).
+  // Mutable for the same reason as sdCardFonts_ (const layout paths may shed
+  // their caches under memory pressure).
+  mutable std::map<int, TtfEpdFont*> ttfFonts_;
 
   // Mutable because drawText() is const but needs to delegate scan-mode
   // recording to the (non-const) FontCacheManager. Same pragmatic compromise
@@ -167,6 +172,7 @@ class GfxRenderer {
   void removeFont(int fontId) {
     fontMap.erase(fontId);
     sdCardFonts_.erase(fontId);
+    ttfFonts_.erase(fontId);
   }
   void setFontCacheManager(FontCacheManager* m) { fontCacheManager_ = m; }
   FontCacheManager* getFontCacheManager() const { return fontCacheManager_; }
@@ -177,6 +183,13 @@ class GfxRenderer {
   void clearSdCardFonts() { sdCardFonts_.clear(); }
   const std::map<int, SdCardFont*>& getSdCardFonts() const { return sdCardFonts_; }
   bool isSdCardFont(int fontId) const { return sdCardFonts_.count(fontId) > 0; }
+  // TTF (vector) fonts rendered via TtfEpdFont/FreeInkFont. Registered like an
+  // ordinary EpdFontFamily (insertFont), plus tracked here so the font cache
+  // manager can prewarm, clear and shed their per-page glyph caches. The
+  // TtfEpdFont is owned by the caller (SdCardFontSystem).
+  void registerTtfFont(int fontId, TtfEpdFont* font) { ttfFonts_[fontId] = font; }
+  void unregisterTtfFont(int fontId) { ttfFonts_.erase(fontId); }
+  const std::map<int, TtfEpdFont*>& getTtfFonts() const { return ttfFonts_; }
   // Register/clear size-matched CJK UI fallbacks (see fallbackFontMap_).
   // setFallbackFont maps a primary UI font id to an SD font id of the same size.
   void setFallbackFont(int primaryFontId, int fallbackFontId) { fallbackFontMap_[primaryFontId] = fallbackFontId; }
